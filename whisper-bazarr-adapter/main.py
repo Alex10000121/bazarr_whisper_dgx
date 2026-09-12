@@ -45,6 +45,11 @@ def _client() -> httpx.Client:
         )
     return _upstream
  
+def _normalize_audio(raw: bytes, hint_filename: str | None = None) -> bytes:
+    if not raw:
+        raise ValueError("empty audio payload")
+    log.info("received %d bytes, filename=%r, first 16 bytes: %s",
+              len(raw), hint_filename, raw[:16].hex()) 
  
 def _get_models_sync() -> list[dict]:
     """Blocking call -- always invoke via run_in_threadpool."""
