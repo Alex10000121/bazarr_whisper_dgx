@@ -35,6 +35,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, File, Form, Query, UploadFile
@@ -60,15 +61,34 @@ OUTPUT_TO_RESPONSE_FORMAT = {
 # faster-whisper content-type for each response_format (mirror of the server).
 RESPONSE_FORMAT_MEDIA = {"srt": "text/plain", "vtt": "text/vtt", "text": "text/plain"}
 
-app = FastAPI(title="whisper-bazarr-adapter")
-# Keep one httpx client for the whole process; faster-whisper serialises work.
-_upstream: httpx.Client | None = None
+# One ASYNC httpx client for the whole process.
+#
+# WHY async: /asr forwards to a transcription that can take minutes on the GPU
+# server. A *synchronous* httpx.Client called from an async route blocks the
+# entire uvicorn event loop for that whole window, so /status (Bazarr's
+# liveness probe) and any queued transcriptions all hang until it finishes.
+# An AsyncClient yields to the loop while waiting, keeping the adapter
+# responsive no matter how long a single transcription takes.
+_upstream: httpx.AsyncClient | None = None
 
 
-def _client() -> httpx.Client:
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Lazy-open on first use; close cleanly on shutdown.
+    try:
+        yield
+    finally:
+        if _upstream is not None:
+            await _upstream.aclose()
+
+
+app = FastAPI(title="whisper-bazarr-adapter", lifespan=lifespan)
+
+
+def _aclient() -> httpx.AsyncClient:
     global _upstream
     if _upstream is None:
-        _upstream = httpx.Client(
+        _upstream = httpx.AsyncClient(
             base_url=UPSTREAM,
             timeout=REQUEST_TIMEOUT,
             headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else {},
@@ -76,7 +96,7 @@ def _client() -> httpx.Client:
     return _upstream
 
 
-def _resolve_model() -> str:
+async def _resolve_model() -> str:
     """Return a usable model id.
 
     Honour an explicit FWSERVER_MODEL; otherwise discover the first model the
@@ -84,7 +104,7 @@ def _resolve_model() -> str:
     """
     if MODEL:
         return MODEL
-    r = _client().get("/v1/models")
+    r = await _aclient().get("/v1/models")
     r.raise_for_status()
     data = r.json().get("data", [])
     if not data:
@@ -133,7 +153,7 @@ def _normalize_audio(raw: bytes, hint_filename: str | None = None) -> bytes:
 
 
 @app.get("/status")
-def status():
+async def status():
     """Health endpoint (ahmetoner-compatible).
 
     Reports the upstream's advertised models when reachable; if the upstream is
@@ -142,7 +162,7 @@ def status():
     """
     upstream_ok, models = True, []
     try:
-        r = _client().get("/v1/models")
+        r = await _aclient().get("/v1/models")
         r.raise_for_status()
         models = [m.get("id") for m in r.json().get("data", [])]
     except Exception as exc:  # upstream down / no network
@@ -188,7 +208,7 @@ async def asr(
     except (ValueError, subprocess.TimeoutExpired) as exc:
         return _error(400, str(exc))
 
-    model = _resolve_model()
+    model = await _resolve_model()
     endpoint = "/v1/audio/transcriptions" if task == "transcribe" else "/v1/audio/translations"
 
     files = {"file": (f"{audio_file.filename or 'audio'}.wav", wav, "audio/wav")}
@@ -199,7 +219,7 @@ async def asr(
         data["prompt"] = initial_prompt
 
     try:
-        r = _client().post(endpoint, data=data, files=files)
+        r = await _aclient().post(endpoint, data=data, files=files)
     except httpx.HTTPError as exc:
         log.exception("upstream request failed")
         return _error(502, f"failed to reach upstream faster-whisper: {exc}")
@@ -231,11 +251,11 @@ async def detect_language(audio_file: UploadFile = File(...), encode: bool = Que
     except (ValueError, subprocess.TimeoutExpired) as exc:
         return _error(400, str(exc))
 
-    model = _resolve_model()
+    model = await _resolve_model()
     files = {"file": (f"{audio_file.filename or 'audio'}.wav", wav, "audio/wav")}
     data = {"model": model, "response_format": "verbose_json"}
     try:
-        r = _client().post("/v1/audio/transcriptions", data=data, files=files)
+        r = await _aclient().post("/v1/audio/transcriptions", data=data, files=files)
     except httpx.HTTPError as exc:
         return _error(502, f"failed to reach upstream: {exc}")
     if r.status_code >= 400:
