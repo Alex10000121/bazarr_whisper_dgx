@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import math
 import os
 import struct
 import subprocess
@@ -15,7 +16,6 @@ from starlette.concurrency import run_in_threadpool
 log = logging.getLogger("whisper-bazarr-adapter")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Port 8000 ist korrekt, da wir 8003 in der docker-compose darauf gemappt haben
 UPSTREAM = os.getenv("FWSERVER", "http://faster-whisper:8000")
 REQUEST_TIMEOUT = float(os.getenv("FWSERVER_TIMEOUT", "1200"))
 FFMPEG = os.getenv("FFMPEG_BIN", "ffmpeg")
@@ -107,6 +107,46 @@ def _normalize_audio(raw: bytes, hint_filename: str | None = None) -> bytes:
             pass
 
 
+# --- CONVERTER: JSON to SRT/VTT ---
+def _format_time(seconds: float, vtt: bool = False) -> str:
+    frac, whole = math.modf(seconds)
+    msecs = int(round(frac * 1000))
+    if msecs == 1000:
+        msecs = 0
+        whole += 1
+    whole = int(whole)
+    h = whole // 3600
+    m = (whole % 3600) // 60
+    s = whole % 60
+    sep = "." if vtt else ","
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{msecs:03d}"
+
+
+def _json_to_srt(data: dict) -> str:
+    lines = []
+    for i, seg in enumerate(data.get("segments", []), start=1):
+        start = _format_time(seg.get("start", 0.0))
+        end = _format_time(seg.get("end", 0.0))
+        text = seg.get("text", "").strip()
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
+
+
+def _json_to_vtt(data: dict) -> str:
+    lines = ["WEBVTT\n"]
+    for i, seg in enumerate(data.get("segments", []), start=1):
+        start = _format_time(seg.get("start", 0.0), vtt=True)
+        end = _format_time(seg.get("end", 0.0), vtt=True)
+        text = seg.get("text", "").strip()
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
+
+
+def _json_to_txt(data: dict) -> str:
+    return "\n".join(seg.get("text", "").strip() for seg in data.get("segments", []))
+# -----------------------------------
+
+
 @app.get("/status")
 async def status():
     upstream_ok = True
@@ -156,7 +196,6 @@ async def asr(
     endpoint = "/transcribe"
     files = {"file": (f"{audio_file.filename or 'audio'}.wav", wav, "audio/wav")}
     
-    # Wir übergeben vorsichtshalber beide gängigen Parameter-Namen für das Ausgabeformat
     data = {
         "response_format": response_format,
         "output_format": response_format
@@ -173,16 +212,27 @@ async def asr(
     if r.status_code >= 400:
         return _error(r.status_code, _friendly_error(r))
 
+    # Intercept JSON and convert to requested format
+    content = r.content
+    try:
+        jdata = r.json()
+        if "segments" in jdata:
+            log.info("WhisperX returned JSON, converting to %s...", out_key)
+            if out_key == "srt":
+                content = _json_to_srt(jdata).encode("utf-8")
+            elif out_key == "vtt":
+                content = _json_to_vtt(jdata).encode("utf-8")
+            elif out_key in ["txt", "text"]:
+                content = _json_to_txt(jdata).encode("utf-8")
+    except Exception:
+        pass  # Data wasn't JSON, leave it as is
+
     media = RESPONSE_FORMAT_MEDIA.get(response_format, "text/plain")
     disposition = _content_disposition(audio_file.filename, out_key)
     headers = {"Content-Disposition": disposition} if disposition else {}
-    
-    # Optionaler Check: Falls WhisperX JSON statt SRT liefert
-    if b'"segments":' in r.content[:100]:
-        log.warning("WhisperX returned JSON instead of raw SRT! Converter might be needed.")
 
     log.info("transcribed %s bytes -> %s (%s)", len(raw), response_format, r.status_code)
-    return Response(content=r.content, media_type=media, status_code=200, headers=headers)
+    return Response(content=content, media_type=media, status_code=200, headers=headers)
 
 
 @app.post("/detect-language")
