@@ -44,12 +44,7 @@ def _client() -> httpx.Client:
             headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else {},
         )
     return _upstream
- 
-def _normalize_audio(raw: bytes, hint_filename: str | None = None) -> bytes:
-    if not raw:
-        raise ValueError("empty audio payload")
-    log.info("received %d bytes, filename=%r, first 16 bytes: %s",
-              len(raw), hint_filename, raw[:16].hex()) 
+
  
 def _get_models_sync() -> list[dict]:
     """Blocking call -- always invoke via run_in_threadpool."""
@@ -79,13 +74,17 @@ async def _resolve_model() -> str:
  
 def _normalize_audio(raw: bytes, hint_filename: str | None = None) -> bytes:
     """Decode any audio to 16 kHz mono WAV (PCM s16le) via ffmpeg.
- 
+
     The input is written to a seekable temp file (MP4/MKV need seekable input;
     a pipe breaks for them), while the normalized WAV is produced on stdout.
     Raises ValueError with ffmpeg's stderr on failure.
     """
     if not raw:
         raise ValueError("empty audio payload")
+        
+    log.warning("DEBUG-PAYLOAD: received %d bytes, filename=%r, first 16 bytes: %s",
+                len(raw), hint_filename, raw[:16].hex())
+                
     ext = os.path.splitext(hint_filename or "")[1] or ".bin"
     tmpdir = tempfile.mkdtemp(prefix="wba_")
     inp = os.path.join(tmpdir, "in" + ext)
