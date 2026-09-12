@@ -27,6 +27,19 @@ seekable temp file (keeping its extension so ffmpeg picks the right demuxer)
 and let ffmpeg write the normalized WAV to stdout. The WAV *output* still uses
 a pipe (it is written forward, no seek needed), so only the input needs to be
 a real file.
+
+Why every upstream httpx call is wrapped in run_in_threadpool?
+----------------------------------------------------------------
+`httpx.Client` (sync) blocks the calling thread for the full request duration.
+A GPU transcription can legitimately take minutes (see REQUEST_TIMEOUT). If a
+sync call were awaited directly inside an `async def` route, it would block
+the single asyncio event loop for that entire duration -- with one Uvicorn
+worker this means /status and every other request stalls until the
+transcription finishes. Wrapping each sync call in run_in_threadpool moves the
+blocking I/O to a worker thread so the event loop stays responsive. (An
+alternative fix would be switching to httpx.AsyncClient; threadpool wrapping
+was chosen here to keep the change minimal and consistent with how the ffmpeg
+subprocess call is already handled.)
 """
 from __future__ import annotations
 
@@ -35,7 +48,6 @@ import logging
 import os
 import subprocess
 import tempfile
-from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, File, Form, Query, UploadFile
@@ -61,39 +73,32 @@ OUTPUT_TO_RESPONSE_FORMAT = {
 # faster-whisper content-type for each response_format (mirror of the server).
 RESPONSE_FORMAT_MEDIA = {"srt": "text/plain", "vtt": "text/vtt", "text": "text/plain"}
 
-# One ASYNC httpx client for the whole process.
-#
-# WHY async: /asr forwards to a transcription that can take minutes on the GPU
-# server. A *synchronous* httpx.Client called from an async route blocks the
-# entire uvicorn event loop for that whole window, so /status (Bazarr's
-# liveness probe) and any queued transcriptions all hang until it finishes.
-# An AsyncClient yields to the loop while waiting, keeping the adapter
-# responsive no matter how long a single transcription takes.
-_upstream: httpx.AsyncClient | None = None
+app = FastAPI(title="whisper-bazarr-adapter")
+# Keep one httpx client for the whole process; faster-whisper serialises work.
+_upstream: httpx.Client | None = None
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    # Lazy-open on first use; close cleanly on shutdown.
-    try:
-        yield
-    finally:
-        if _upstream is not None:
-            await _upstream.aclose()
-
-
-app = FastAPI(title="whisper-bazarr-adapter", lifespan=lifespan)
-
-
-def _aclient() -> httpx.AsyncClient:
+def _client() -> httpx.Client:
     global _upstream
     if _upstream is None:
-        _upstream = httpx.AsyncClient(
+        _upstream = httpx.Client(
             base_url=UPSTREAM,
             timeout=REQUEST_TIMEOUT,
             headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else {},
         )
     return _upstream
+
+
+def _get_models_sync() -> list[dict]:
+    """Blocking call -- always invoke via run_in_threadpool."""
+    r = _client().get("/v1/models")
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def _post_sync(endpoint: str, data: dict, files: dict) -> httpx.Response:
+    """Blocking call -- always invoke via run_in_threadpool."""
+    return _client().post(endpoint, data=data, files=files)
 
 
 async def _resolve_model() -> str:
@@ -104,9 +109,7 @@ async def _resolve_model() -> str:
     """
     if MODEL:
         return MODEL
-    r = await _aclient().get("/v1/models")
-    r.raise_for_status()
-    data = r.json().get("data", [])
+    data = await run_in_threadpool(_get_models_sync)
     if not data:
         raise RuntimeError(f"upstream {UPSTREAM} reported no models")
     return data[0]["id"]
@@ -162,9 +165,8 @@ async def status():
     """
     upstream_ok, models = True, []
     try:
-        r = await _aclient().get("/v1/models")
-        r.raise_for_status()
-        models = [m.get("id") for m in r.json().get("data", [])]
+        data = await run_in_threadpool(_get_models_sync)
+        models = [m.get("id") for m in data]
     except Exception as exc:  # upstream down / no network
         upstream_ok = False
         log.warning("upstream unreachable: %s", exc)
@@ -208,7 +210,11 @@ async def asr(
     except (ValueError, subprocess.TimeoutExpired) as exc:
         return _error(400, str(exc))
 
-    model = await _resolve_model()
+    try:
+        model = await _resolve_model()
+    except (httpx.HTTPError, RuntimeError) as exc:
+        return _error(502, f"could not resolve model from upstream: {exc}")
+
     endpoint = "/v1/audio/transcriptions" if task == "transcribe" else "/v1/audio/translations"
 
     files = {"file": (f"{audio_file.filename or 'audio'}.wav", wav, "audio/wav")}
@@ -219,7 +225,7 @@ async def asr(
         data["prompt"] = initial_prompt
 
     try:
-        r = await _aclient().post(endpoint, data=data, files=files)
+        r = await run_in_threadpool(_post_sync, endpoint, data, files)
     except httpx.HTTPError as exc:
         log.exception("upstream request failed")
         return _error(502, f"failed to reach upstream faster-whisper: {exc}")
@@ -251,11 +257,15 @@ async def detect_language(audio_file: UploadFile = File(...), encode: bool = Que
     except (ValueError, subprocess.TimeoutExpired) as exc:
         return _error(400, str(exc))
 
-    model = await _resolve_model()
+    try:
+        model = await _resolve_model()
+    except (httpx.HTTPError, RuntimeError) as exc:
+        return _error(502, f"could not resolve model from upstream: {exc}")
+
     files = {"file": (f"{audio_file.filename or 'audio'}.wav", wav, "audio/wav")}
     data = {"model": model, "response_format": "verbose_json"}
     try:
-        r = await _aclient().post("/v1/audio/transcriptions", data=data, files=files)
+        r = await run_in_threadpool(_post_sync, "/v1/audio/transcriptions", data, files)
     except httpx.HTTPError as exc:
         return _error(502, f"failed to reach upstream: {exc}")
     if r.status_code >= 400:
