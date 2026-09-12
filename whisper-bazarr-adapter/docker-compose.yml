@@ -1,0 +1,63 @@
+# Adapts the existing `faster-whisper` GPU server to the legacy
+# ahmetoner/whisper-asr-webservice API that Bazarr understands.
+#
+# IMPORTANT: the `faster-whisper` service is ALREADY defined elsewhere in your
+# stack (fedirz/faster-whisper-server:latest-cuda, service name "faster-whisper",
+# port 8000). We deliberately do NOT redefine it here. For `depends_on` to
+# resolve in the SAME compose project, either:
+#   (a) merge this service into the compose file that already defines
+#       `faster-whisper`, or
+#   (b) start `faster-whisper` with a shared user-defined network and put the
+#       adapter on that network (see `networks: external` below).
+# The cleanest path is (a): copy the `whisper-bazarr-adapter` service block into
+# your existing docker-compose.yml.
+
+services:
+  whisper-bazarr-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whisper-bazarr-adapter:local
+    container_name: whisper-bazarr-adapter
+    ports:
+      - "9000:9000"
+    environment:
+      # Base URL of the running faster-whisper GPU server (service name resolves
+      # inside the shared compose network). Default matches the stated setup.
+      FWSERVER: "http://faster-whisper:8000"
+      # Model id to request. Leave EMPTY to auto-discover the first model the
+      # server reports via GET /v1/models (recommended — never hard-code a
+      # placeholder). To pin a specific one, set e.g. "Systran/faster-whisper-large-v3".
+      FWSERVER_MODEL: ""
+      # Only set if the GPU server is fronted by an auth proxy / API key.
+      FWSERVER_API_KEY: ""
+      # Give long transcriptions room; the GPU box was benchmarked at ~4x realtime.
+      FWSERVER_TIMEOUT: "1200"
+    depends_on:
+      - faster-whisper
+    restart: unless-stopped
+
+  # Referenced above but NOT defined here (it must come from your existing
+  # stack). Kept as a comment so `depends_on` intent is visible:
+  # faster-whisper:
+  #   image: fedirz/faster-whisper-server:latest-cuda
+  #   ports: ["8000:8000"]
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   # volumes: hf model cache, etc.
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
+  #     interval: 20s
+  #     timeout: 5s
+  #     retries: 10
+
+networks:
+  default:
+    # If both services already live on a shared user-defined network, name it:
+    # external:
+    #   name: my-media-network
