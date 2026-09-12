@@ -15,10 +15,9 @@ from starlette.concurrency import run_in_threadpool
 log = logging.getLogger("whisper-bazarr-adapter")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# Port 8000 ist korrekt, da wir 8003 in der docker-compose darauf gemappt haben
 UPSTREAM = os.getenv("FWSERVER", "http://faster-whisper:8000")
-MODEL = os.getenv("FWSERVER_MODEL", "")          # empty => auto-discover via /v1/models
-API_KEY = os.getenv("FWSERVER_API_KEY", "")      # optional Bearer auth for upstream
-REQUEST_TIMEOUT = float(os.getenv("FWSERVER_TIMEOUT", "1200"))  # GPU transcribes can be long
+REQUEST_TIMEOUT = float(os.getenv("FWSERVER_TIMEOUT", "1200"))
 FFMPEG = os.getenv("FFMPEG_BIN", "ffmpeg")
 
 OUTPUT_TO_RESPONSE_FORMAT = {
@@ -39,28 +38,18 @@ def _client() -> httpx.Client:
         _upstream = httpx.Client(
             base_url=UPSTREAM,
             timeout=REQUEST_TIMEOUT,
-            headers={"Authorization": f"Bearer {API_KEY}"} if API_KEY else {},
         )
     return _upstream
 
 
-def _get_models_sync() -> list[dict]:
-    r = _client().get("/v1/models")
+def _health_sync() -> dict:
+    r = _client().get("/health")
     r.raise_for_status()
-    return r.json().get("data", [])
+    return r.json()
 
 
 def _post_sync(endpoint: str, data: dict, files: dict) -> httpx.Response:
     return _client().post(endpoint, data=data, files=files)
-
-
-async def _resolve_model() -> str:
-    if MODEL:
-        return MODEL
-    data = await run_in_threadpool(_get_models_sync)
-    if not data:
-        raise RuntimeError(f"upstream {UPSTREAM} reported no models")
-    return data[0]["id"]
 
 
 def _pcm_to_wav(pcm_data: bytes) -> bytes:
@@ -120,10 +109,9 @@ def _normalize_audio(raw: bytes, hint_filename: str | None = None) -> bytes:
 
 @app.get("/status")
 async def status():
-    upstream_ok, models = True, []
+    upstream_ok = True
     try:
-        data = await run_in_threadpool(_get_models_sync)
-        models = [m.get("id") for m in data]
+        await run_in_threadpool(_health_sync)
     except Exception as exc: 
         upstream_ok = False
         log.warning("upstream unreachable: %s", exc)
@@ -131,10 +119,10 @@ async def status():
         status_code=200,
         content={
             "status": "ok" if upstream_ok else "upstream_unreachable",
-            "engine": "faster-whisper",
+            "engine": "whisperx",
             "upstream": "up" if upstream_ok else "down",
             "upstream_url": UPSTREAM,
-            "models": models,
+            "models": ["whisperx-blackwell"],
         },
     )
 
@@ -165,25 +153,22 @@ async def asr(
     except (ValueError, subprocess.TimeoutExpired) as exc:
         return _error(400, str(exc))
 
-    try:
-        model = await _resolve_model()
-    except (httpx.HTTPError, RuntimeError) as exc:
-        return _error(502, f"could not resolve model from upstream: {exc}")
-
-    endpoint = "/v1/audio/transcriptions" if task == "transcribe" else "/v1/audio/translations"
-
+    endpoint = "/transcribe"
     files = {"file": (f"{audio_file.filename or 'audio'}.wav", wav, "audio/wav")}
-    data = {"model": model, "response_format": response_format}
+    
+    # Wir übergeben vorsichtshalber beide gängigen Parameter-Namen für das Ausgabeformat
+    data = {
+        "response_format": response_format,
+        "output_format": response_format
+    }
     if language:
         data["language"] = language
-    if initial_prompt:
-        data["prompt"] = initial_prompt
 
     try:
         r = await run_in_threadpool(_post_sync, endpoint, data, files)
     except httpx.HTTPError as exc:
         log.exception("upstream request failed")
-        return _error(502, f"failed to reach upstream faster-whisper: {exc}")
+        return _error(502, f"failed to reach upstream WhisperX: {exc}")
 
     if r.status_code >= 400:
         return _error(r.status_code, _friendly_error(r))
@@ -191,8 +176,11 @@ async def asr(
     media = RESPONSE_FORMAT_MEDIA.get(response_format, "text/plain")
     disposition = _content_disposition(audio_file.filename, out_key)
     headers = {"Content-Disposition": disposition} if disposition else {}
-    if "x-detected-language" in r.headers:
-        headers["X-Detected-Language"] = r.headers["x-detected-language"]
+    
+    # Optionaler Check: Falls WhisperX JSON statt SRT liefert
+    if b'"segments":' in r.content[:100]:
+        log.warning("WhisperX returned JSON instead of raw SRT! Converter might be needed.")
+
     log.info("transcribed %s bytes -> %s (%s)", len(raw), response_format, r.status_code)
     return Response(content=r.content, media_type=media, status_code=200, headers=headers)
 
@@ -208,23 +196,22 @@ async def detect_language(audio_file: UploadFile = File(...), encode: bool = Que
     except (ValueError, subprocess.TimeoutExpired) as exc:
         return _error(400, str(exc))
 
-    try:
-        model = await _resolve_model()
-    except (httpx.HTTPError, RuntimeError) as exc:
-        return _error(502, f"could not resolve model from upstream: {exc}")
-
     files = {"file": (f"{audio_file.filename or 'audio'}.wav", wav, "audio/wav")}
-    data = {"model": model, "response_format": "verbose_json"}
+    data = {"response_format": "json"}
     try:
-        r = await run_in_threadpool(_post_sync, "/v1/audio/transcriptions", data, files)
+        r = await run_in_threadpool(_post_sync, "/transcribe", data, files)
     except httpx.HTTPError as exc:
         return _error(502, f"failed to reach upstream: {exc}")
     if r.status_code >= 400:
         return _error(r.status_code, _friendly_error(r))
 
-    body = r.json()
-    lang_code = (body.get("language") or "").strip().lower()
-    return JSONResponse(content=_detect_language_payload(lang_code, body))
+    try:
+        body = r.json()
+        lang_code = (body.get("language") or "").strip().lower()
+    except Exception:
+        lang_code = "und"
+        
+    return JSONResponse(content=_detect_language_payload(lang_code, {}))
 
 
 def _error(code: int, msg: str):
