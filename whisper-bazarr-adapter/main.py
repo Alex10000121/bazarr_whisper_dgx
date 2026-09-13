@@ -65,7 +65,7 @@ def _client() -> httpx.Client:
 
 
 def _health_sync() -> dict:
-    r = _client().get("/health")
+    r = _client().get("/health", timeout=3.0)
     r.raise_for_status()
     return r.json()
 
