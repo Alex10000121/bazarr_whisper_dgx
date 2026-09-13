@@ -68,13 +68,6 @@ schlägt aber beim ersten echten Transkriptionsversuch fehl:
 docker compose -f docker-compose.yml up -d
 ```
 
-Das Adapter-Image wird automatisch per GitHub Actions gebaut, sobald sich
-etwas im Ordner `whisper-bazarr-adapter/` ändert (Branch `main`), und nach
-`ghcr.io/alex10000121/bazarr_whisper_dgx/whisper-bazarr-adapter:latest`
-gepusht. Falls das GHCR-Package privat ist, einmalig einloggen:
-```bash
-docker login ghcr.io -u alex10000121
-```
 
 ### Lokal (Adapter wird selbst gebaut, z. B. für Entwicklung/Debugging)
 
