@@ -28,9 +28,7 @@ services:
       - whisper
 
   whisper-bazarr-adapter:
-    build:
-      context: ./adapter
-      dockerfile: Dockerfile
+    build: .
     image: whisper-bazarr-adapter:local
     container_name: whisper-bazarr-adapter
     restart: unless-stopped
