@@ -24,4 +24,4 @@ EXPOSE 9000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/status', timeout=4).status==200 else 1)"
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000", "--server-header", "false"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]
