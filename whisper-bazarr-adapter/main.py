@@ -176,14 +176,23 @@ def _json_to_txt(data: dict) -> str:
 _CONVERTERS = {"srt": _json_to_srt, "vtt": _json_to_vtt, "txt": _json_to_txt, "text": _json_to_txt}
 
 
+_last_upstream_ok: bool | None = None
+
+
 @app.get("/status")
 async def status():
+    global _last_upstream_ok
     upstream_ok = True
     try:
         await run_in_threadpool(_health_sync)
     except Exception as exc:
         upstream_ok = False
-        log.warning("upstream unreachable: %s", exc)
+        if _last_upstream_ok is not False:
+            log.warning("upstream unreachable: %s", exc)
+    else:
+        if _last_upstream_ok is False:
+            log.info("upstream reachable again")
+    _last_upstream_ok = upstream_ok
     return JSONResponse(
         status_code=200,
         content={
