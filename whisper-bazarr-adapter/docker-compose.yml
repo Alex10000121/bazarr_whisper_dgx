@@ -1,22 +1,53 @@
 services:
+  whisperx:
+    image: mekopa/whisperx-blackwell:latest
+    container_name: whisperx
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+      HF_HOME: "/root/.cache/huggingface"
+      TORCH_HOME: "/root/.cache/torch"
+    volumes:
+      - whisperx-cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8003 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+    networks:
+      - whisper
+
   whisper-bazarr-adapter:
     build:
-      context: .
+      context: ./adapter
       dockerfile: Dockerfile
     image: whisper-bazarr-adapter:local
     container_name: whisper-bazarr-adapter
+    restart: unless-stopped
+    depends_on:
+      whisperx:
+        condition: service_healthy
     ports:
       - "9000:9000"
     environment:
-      FWSERVER: "http://faster-whisper:8000"
-      FWSERVER_MODEL: ""
-      FWSERVER_API_KEY: ""
+      FWSERVER: "http://whisperx:8003"
       FWSERVER_TIMEOUT: "1200"
-    restart: unless-stopped
     networks:
-      - default
+      - whisper
+
+volumes:
+  whisperx-cache:
 
 networks:
-  default:
-    name: whisper
+  whisper:
     external: true
