@@ -28,8 +28,7 @@ services:
       - whisper
 
   whisper-bazarr-adapter:
-    build: .
-    image: whisper-bazarr-adapter:local
+    image: ghcr.io/alex10000121/bazarr_whisper_dgx/whisper-bazarr-adapter:latest
     container_name: whisper-bazarr-adapter
     restart: unless-stopped
     depends_on:

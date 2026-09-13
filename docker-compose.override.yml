@@ -1,0 +1,5 @@
+services:
+  whisper-bazarr-adapter:
+    build:
+      context: ./whisper-bazarr-adapter
+    image: whisper-bazarr-adapter:local
