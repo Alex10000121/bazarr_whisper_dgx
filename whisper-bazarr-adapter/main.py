@@ -17,6 +17,18 @@ from starlette.concurrency import run_in_threadpool
 log = logging.getLogger("whisper-bazarr-adapter")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+
+class _SuppressStatusAccessLog(logging.Filter):
+    """Drop uvicorn access-log lines for the noisy /status healthcheck polling,
+    while leaving /asr, /detect-language, and error logs untouched."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/status" not in record.getMessage()
+
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").addFilter(_SuppressStatusAccessLog())
+
 UPSTREAM = os.getenv("FWSERVER", "http://whisperx:8003")
 REQUEST_TIMEOUT = float(os.getenv("FWSERVER_TIMEOUT", "1200"))
 FFMPEG = os.getenv("FFMPEG_BIN", "ffmpeg")
